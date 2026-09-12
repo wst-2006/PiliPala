@@ -13,7 +13,7 @@
 ### 本修改版
 - 项目名称：噼里啪啦
 - 维护者：GitHub 用户 wst-2006
-- 项目主页：https://github.com/wst-2006/噼里啪啦
+- 项目主页：https://github.com/wst-2006/PiliPala
 
 
 ---
