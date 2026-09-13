@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.aspectRatio
@@ -40,6 +41,13 @@ import com.bililite.data.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import androidx.room.withTransaction
 
 // ---------- ViewModel ----------
 class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewModel() {
@@ -66,7 +74,9 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
     var history by mutableStateOf<List<Watch>>(emptyList()); private set      // 播放历史
     var syncing by mutableStateOf(false); private set
     // 首页 UI 状态(提升到 VM,退出播放后保留排序/搜索/筛选)
-    var homeSortMode by mutableStateOf(0)                 // 0 综合 1 播放量 2 按时间
+    var homeSortMode by mutableStateOf(0)                 // 0 推荐 2 新发布
+    private val videoSyncSlots = Semaphore(3)
+    private val feedUpdateLock = Mutex()
     var homeKeyword by mutableStateOf("")                 // 已提交搜索词
     var homeBvidMode by mutableStateOf(false)             // 是否在 bvid 结果页
     var homeFilterMids by mutableStateOf<Set<String>>(emptySet())  // UP 筛选
@@ -120,7 +130,7 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
         }
     }
 
-    suspend fun reload() {
+    suspend fun reload() = feedUpdateLock.withLock {
         val u = withContext(Dispatchers.IO) { db.upDao().all() }
         ups = u
         val v = if (u.isEmpty()) emptyList()
@@ -130,7 +140,10 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
         // 这是"退出播放回到原位置"的前提)
         val newIds = v.map { it.id }.toHashSet()
         if (newIds != lastFeedIds) {
-            feedVids = v.shuffled()
+            val byId = v.associateBy { it.id }
+            val retained = feedVids.mapNotNull { byId[it.id] }
+            val retainedIds = retained.map { it.id }.toSet()
+            feedVids = retained + v.filter { it.id !in retainedIds }.shuffled()
             lastFeedIds = newIds
         } else {
             val byId = v.associateBy { it.id }
@@ -232,8 +245,20 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
             pubdate = v.pubdate.takeIf { it > 0 } ?: existing[v.id]?.pubdate ?: 0L)
         }
     }
-    private suspend fun fetchAllVideos(mid: String, maxPages: Int = 60): List<Video> {
+    private suspend fun fetchAllVideos(
+        mid: String,
+        maxPages: Int = 60,
+        onPage: (suspend (List<Video>, Int?, Int) -> Unit)? = null
+    ): List<Video> = videoSyncSlots.withPermit {
+        withContext(Dispatchers.IO) { fetchVideoPages(mid, maxPages, onPage) }
+    }
+
+    private suspend fun fetchVideoPages(
+        mid: String, maxPages: Int,
+        onPage: (suspend (List<Video>, Int?, Int) -> Unit)?
+    ): List<Video> {
         val out = ArrayList<Video>()
+        val seen = HashSet<Long>()
         var pn = 1
         var useWbi = false      // 默认走 arc/list(稳定)
         var fallbackTried = false
@@ -241,6 +266,8 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
             val j = try {
                 if (useWbi) api.userVideos(mid.toLongOrNull() ?: 0L, pn)
                 else api.userVideosNoWbi(mid.toLongOrNull() ?: 0L, pn)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 if (!useWbi && !fallbackTried) {
                     useWbi = true; fallbackTried = true
@@ -259,10 +286,16 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
             val list = data?.optJSONObject("list")?.optJSONArray("vlist")
                 ?: data?.optJSONArray("archives")
                 ?: data?.optJSONArray("vlist")
-            val total = data?.optJSONObject("page")?.optInt("count", 0)
-                ?: data?.optInt("count", 0)
-                ?: data?.optInt("total_count", 0) ?: 0
-            if (list == null || list.length() == 0) break
+            val total = listOfNotNull(data?.optJSONObject("page")?.optInt("count", 0),
+                data?.optInt("count", 0), data?.optInt("total_count", 0))
+                .firstOrNull { it > 0 } ?: 0
+            if (list == null) throw Exception("视频列表响应不完整")
+            if (list.length() == 0) {
+                if (total > out.size) throw Exception("视频列表提前结束，请重试")
+                onPage?.invoke(emptyList(), total.takeIf { it > 0 } ?: out.size, pn)
+                break
+            }
+            val pageVideos = ArrayList<Video>()
             for (i in 0 until list.length()) {
                 val o = list.optJSONObject(i) ?: continue
                 val bvid = o.optString("bvid", "")
@@ -274,7 +307,7 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
                 // 分P数: videos(number) 或 pages(数组)
                 val pages = if (o.has("videos")) o.optInt("videos", 1)
                             else o.optJSONArray("pages")?.length() ?: 1
-                out.add(Video(
+                pageVideos.add(Video(
                     id = aid, bvid = bvid, upId = mid, title = title,
                     durationSec = dur, pages = pages,
                     pic = normalizeCover(o.optString("pic", o.optString("cover", ""))),
@@ -283,7 +316,12 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
                     pubdate = readVideoPubdate(o)
                 ))
             }
-            if (out.size >= total || list.length() < 30) break
+            val fresh = pageVideos.filter { seen.add(it.id) }
+            if (fresh.isEmpty()) throw Exception("接口返回重复页，请稍后重试")
+            out.addAll(fresh)
+            val finished = if (total > 0) out.size >= total else list.length() < 30
+            onPage?.invoke(fresh, total.takeIf { it > 0 } ?: out.size.takeIf { finished }, pn)
+            if (finished) break
             pn++
         }
         return out
@@ -431,31 +469,103 @@ class BiliViewModel(private val db: BiliDb, private val ctx: Context) : ViewMode
         }
     }
 
+    data class UpSyncProgress(
+        val up: Up, val status: String = "排队中", val received: Int = 0,
+        val total: Int? = null, val page: Int = 0, val error: String = ""
+    )
+    var batchProgress by mutableStateOf<List<UpSyncProgress>>(emptyList()); private set
+    var batchRunning by mutableStateOf(false); private set
+    var batchMessage by mutableStateOf(""); private set
+
+    private fun updateBatch(id: String, change: (UpSyncProgress) -> UpSyncProgress) {
+        batchProgress = batchProgress.map { if (it.up.id == id) change(it) else it }
+        val done = batchProgress.count { it.status == "完成" || it.status == "失败" }
+        msg = "同步 $done/${batchProgress.size} 个 UP · 已获取 ${batchProgress.sumOf { it.received }} 个视频"
+    }
+
+    fun retryBatchSync() {
+        if (syncing) return
+        startBatchSync(batchProgress.filter { it.status == "失败" }.map { it.up })
+    }
+
     fun addFollowedUpsAndSync() {
+        if (syncing) return
         val pending = selectedFollowed.map { it.up }
             .filter { candidate -> ups.none { it.id == candidate.id } }
         if (pending.isEmpty()) {
             followedMsg = "所选 UP 都已经添加"
             return
         }
+        startBatchSync(pending)
+    }
+
+    private fun startBatchSync(pending: List<Up>) {
+        if (pending.isEmpty() || syncing) return
+        syncing = true
+        batchRunning = true
+        batchMessage = "正在保存 ${pending.size} 个 UP"
+        batchProgress = pending.distinctBy { it.id }.map { UpSyncProgress(it) }
         viewModelScope.launch {
-            syncing = true
             try {
-                pending.forEachIndexed { index, up ->
-                    msg = "同步 ${index + 1}/${pending.size}：${up.name}"
-                    withContext(Dispatchers.IO) { db.upDao().upsert(up) }
-                    val all = fetchAllVideos(up.id)
-                    if (all.isNotEmpty()) {
-                        val merged = withContext(Dispatchers.IO) { mergeFavorites(all) }
-                        withContext(Dispatchers.IO) { db.videoDao().upsertAll(merged) }
+                withContext(Dispatchers.IO) {
+                    db.withTransaction {
+                        val existing = db.upDao().all().map { it.id }.toSet()
+                        pending.filter { it.id !in existing }.forEach { db.upDao().upsert(it) }
                     }
                 }
                 reload()
-                followedMsg = "已添加 ${pending.size} 个 UP，并完成同步"
+                clearFollowedSelection()
+                batchMessage = "UP 已添加，正在同步视频"
+                // Three workers share a main-thread iterator; each UP keeps its own page cursor.
+                val queue = pending.distinctBy { it.id }.iterator()
+                coroutineScope {
+                    repeat(minOf(3, pending.size)) {
+                        launch {
+                            while (queue.hasNext()) {
+                                val up = queue.next()
+                                updateBatch(up.id) { it.copy(status = "同步中") }
+                                try {
+                                    fetchAllVideos(up.id, maxPages = Int.MAX_VALUE) { videos, total, page ->
+                                        val merged = db.withTransaction {
+                                            mergeFavorites(videos).also { db.videoDao().upsertAll(it) }
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            feedUpdateLock.withLock {
+                                            val replacements = merged.associateBy { it.id }
+                                            val known = vids.map { it.id }.toSet()
+                                            val added = merged.filter { it.id !in known }
+                                            vids = vids.map { replacements[it.id] ?: it } + added
+                                            feedVids = feedVids.map { replacements[it.id] ?: it } + added.shuffled()
+                                            lastFeedIds = vids.map { it.id }.toSet()
+                                            }
+                                            updateBatch(up.id) {
+                                                it.copy(received = it.received + videos.size, total = total, page = page)
+                                            }
+                                        }
+                                    }
+                                    updateBatch(up.id) { it.copy(status = "完成") }
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    updateBatch(up.id) { it.copy(status = "失败", error = e.message ?: "网络错误") }
+                                }
+                            }
+                        }
+                    }
+                }
+                val failed = batchProgress.count { it.status == "失败" }
+                batchMessage = "同步结束：成功 ${batchProgress.size - failed} 个，失败 $failed 个"
+            } catch (e: CancellationException) {
+                batchMessage = "同步已中断，已保存的视频保留"
+                throw e
             } catch (e: Exception) {
-                followedMsg = "批量添加中断：${e.message ?: "网络错误"}"
-                reload()
+                batchMessage = "批量同步中断：${e.message ?: "网络错误"}"
+                batchProgress = batchProgress.map {
+                    if (it.status == "完成") it else it.copy(status = "失败", error = batchMessage)
+                }
             } finally {
+                followedMsg = batchMessage
+                batchRunning = false
                 syncing = false
             }
         }
@@ -1368,7 +1478,6 @@ fun HomeScreen(vm: BiliViewModel,
         if (vm.watchFilter == 1) base = base.filter { it.id !in vm.watchedIds }      // 未看
         else if (vm.watchFilter == 2) base = base.filter { it.id in vm.watchedIds }   // 已看
         when (vm.homeSortMode) {
-            1 -> base.sortedByDescending { it.playCount }   // 播放量
             2 -> base.sortedByDescending { it.pubdate }     // 按时间(新→旧)
             else -> base                                    // 综合(保持原随机顺序)
         }
@@ -1416,25 +1525,21 @@ fun HomeScreen(vm: BiliViewModel,
             }
         }
 
-        // 排序 + UP 筛选 + 已看/未看 行(v0.4.15 收起;v0.4.19 合并到同一行,可横向滚动)
+        TabRow(selectedTabIndex = if (vm.homeSortMode == 2) 1 else 0,
+            containerColor = C.card, contentColor = C.t1) {
+            listOf("推荐" to 0, "新发布" to 2).forEach { (label, mode) ->
+                Tab(selected = vm.homeSortMode == mode,
+                    onClick = { vm.homeSortMode = mode },
+                    text = { Text(label) })
+            }
+        }
+
+        // UP 筛选与观看状态保留在筛选区。
         if (filtersExpanded) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
                 .horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically) {
-            // 综合 / 播放量 / 按时间
-            listOf("综合", "播放量", "按时间").forEachIndexed { i, label ->
-                Surface(
-                    color = if (vm.homeSortMode == i) C.block else C.card,
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
-                    border = if (vm.homeSortMode == i) null else androidx.compose.foundation.BorderStroke(1.dp, C.line),
-                    modifier = Modifier.clickable { vm.homeSortMode = i }
-                ) {
-                    Text(label, fontSize = 12.sp,
-                        color = if (vm.homeSortMode == i) C.onBlock else C.t1,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
-                }
-            }
             // UP 筛选
             Surface(
                 color = if (vm.homeFilterMids.isNotEmpty()) C.block else C.card,
@@ -2211,12 +2316,63 @@ private fun AccountScreen(vm: BiliViewModel, onBack: () -> Unit, onLoggedOut: ()
 
 /** 管理UP主:添加 / 删除 / 分组 / 从关注批量添加 */
 @Composable
+private fun BatchSyncStatus(vm: BiliViewModel) {
+    val entries = vm.batchProgress
+    if (entries.isEmpty()) return
+    val succeeded = entries.count { it.status == "完成" }
+    val failed = entries.count { it.status == "失败" }
+    val processed = succeeded + failed
+    val received = entries.sumOf { it.received.toLong() }
+    val remaining = if (entries.all { it.total != null })
+        entries.sumOf { ((it.total ?: 0) - it.received).coerceAtLeast(0).toLong() }.toString()
+        else "统计中"
+    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(vm.batchMessage, color = C.t1, fontSize = 13.sp)
+        LinearProgressIndicator(progress = processed.toFloat() / entries.size,
+            modifier = Modifier.fillMaxWidth(), color = C.t1, trackColor = C.soft)
+        Text("已处理 $processed/${entries.size} 个 UP · 成功 $succeeded · 失败 $failed",
+            color = C.t2, fontSize = 12.sp)
+        Text("已获取 $received 个视频 · 剩余视频：$remaining", color = C.t2, fontSize = 12.sp)
+        if (vm.batchRunning) {
+            entries.filter { it.status == "同步中" }.forEach {
+                Text("${it.up.name} · ${if (it.page == 0) "等待首个视频页" else "已保存第 ${it.page} 页"}",
+                    color = C.t2, fontSize = 12.sp, maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            }
+            Text("正在同步，可在应用内自由浏览。同步完成前请保持应用在前台，避免退出或息屏。",
+                color = C.t2, fontSize = 12.sp)
+        } else if (failed > 0) {
+            var showFailures by remember { mutableStateOf(false) }
+            Row {
+                TextButton(onClick = { vm.retryBatchSync() }, enabled = !vm.syncing) {
+                    Text("重试失败项", color = C.t1)
+                }
+                TextButton(onClick = { showFailures = true }) { Text("失败详情", color = C.t2) }
+            }
+            if (showFailures) {
+                AlertDialog(onDismissRequest = { showFailures = false },
+                    title = { Text("同步失败") },
+                    text = {
+                        LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                            items(entries.filter { it.status == "失败" }, key = { it.up.id }) {
+                                Text("${it.up.name}：${it.error}", modifier = Modifier.padding(vertical = 6.dp))
+                            }
+                        }
+                    },
+                    confirmButton = { TextButton(onClick = { showFailures = false }) { Text("关闭") } })
+            }
+        }
+    }
+}
+
+@Composable
 fun ManageUPScreen(vm: BiliViewModel, onBack: () -> Unit = {}) {
     var mode by remember { mutableStateOf(0) } // 0 首页 1 添加 2 删除 3 分组 4 关注列表
     BackHandler { if (mode == 0) onBack() else mode = 0 }
 
     if (mode == 0) {
-        Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onBack) { Text("← 返回", color = C.t1) }
                 Text("管理UP主", style = MaterialTheme.typography.titleMedium, color = C.t1)
@@ -2242,6 +2398,7 @@ fun ManageUPScreen(vm: BiliViewModel, onBack: () -> Unit = {}) {
                 modifier = Modifier.fillMaxWidth().height(52.dp)) {
                 Text("UP分组(首页快速筛选)", color = C.t1, fontSize = 16.sp)
             }
+            BatchSyncStatus(vm)
         }
         return
     }
@@ -2474,10 +2631,11 @@ private fun FollowedUpScreen(vm: BiliViewModel, onBack: () -> Unit) {
                 colors = ButtonDefaults.buttonColors(containerColor = C.block),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("添加选中的 ${selectedItems.size} 个 UP", color = C.onBlock)
+                Text(if (vm.batchRunning) "正在同步" else "添加选中的 ${selectedItems.size} 个 UP", color = C.onBlock)
             }
         }
-        if (vm.followedMsg.isNotEmpty()) {
+        BatchSyncStatus(vm)
+        if (vm.followedMsg.isNotEmpty() && !vm.batchRunning) {
             Text(vm.followedMsg, color = C.t2, fontSize = 12.sp)
             Spacer(Modifier.height(4.dp))
         }
