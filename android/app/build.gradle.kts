@@ -8,7 +8,7 @@ android {
     compileSdk = 35
     buildToolsVersion = "35.0.0"
     defaultConfig { applicationId = "com.bililite.app"; minSdk = 24; targetSdk = 35
-        versionCode = 19; versionName = "0.6.0"
+        versionCode = 20; versionName = "0.6.1"
         manifestPlaceholders["appLabel"] = "噼里啪啦"
     }
     buildTypes {

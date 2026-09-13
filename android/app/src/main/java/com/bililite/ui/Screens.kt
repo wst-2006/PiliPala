@@ -1875,11 +1875,6 @@ fun ProfileScreen(vm: BiliViewModel, onLoggedOut: () -> Unit = {},
             })
         }
 
-        // 底部占满,QQ 群号贴最下方(还原为单一群号,16sp 加粗)
-        Spacer(Modifier.weight(1f))
-        Text("QQ交流群：811598424", color = C.t1, fontSize = 16.sp,
-            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
-            modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 8.dp))
     }
     }
 }

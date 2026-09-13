@@ -261,11 +261,11 @@ class BiliApi(private val ctx: Context) {
     /** 登录态下取当前用户信息(拿 uname 等) */
     suspend fun nav(): JSONObject = get("https://api.bilibili.com/x/web-interface/nav")
 
-    /** 当前登录用户的关注列表。 */
+    /** 按关注顺序分页；order_type=attention 是最常访问排序，不能用于时间分页。 */
     suspend fun followings(vmid: Long, page: Int = 1, pageSize: Int = 50): JSONObject =
         get(
             "https://api.bilibili.com/x/relation/followings" +
-                "?vmid=$vmid&pn=$page&ps=$pageSize&order=desc&order_type=attention",
+                "?vmid=$vmid&pn=$page&ps=$pageSize&order=desc&order_type=",
             space = false
         )
 
